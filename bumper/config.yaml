@@ -1,0 +1,35 @@
+name: Bumper
+version: "0.4.1"
+slug: bumper
+description: Self-hosted Ecovacs cloud (MVladislav/bumper) for local control of Deebot robots
+url: https://github.com/MVladislav/bumper
+arch:
+  - aarch64
+  - amd64
+image: ghcr.io/mvladislav/bumper
+init: false
+startup: services
+boot: auto
+map:
+  - addon_config:rw
+environment:
+  BUMPER_LISTEN: 0.0.0.0
+  BUMPER_ANNOUNCE_IP: 192.168.0.115
+  BUMPER_DATA: /config/data
+  BUMPER_CERTS: /config/certs
+  DB_FILE: /config/data/bumper.db
+  TZ: Europe/Rome
+ports:
+  8007/tcp: 8007
+  5223/tcp: 5223
+  8883/tcp: 8883
+  443/tcp: null
+  1883/tcp: null
+  1223/tcp: null
+ports_description:
+  8007/tcp: Bumper web (HTTP)
+  5223/tcp: XMPP TLS (legacy Deebot)
+  8883/tcp: MQTT TLS
+  443/tcp: Bumper web (HTTPS, only for the Ecovacs app)
+  1883/tcp: MQTT plain (disabled, Mosquitto uses it)
+  1223/tcp: XMPP plain (disabled)
