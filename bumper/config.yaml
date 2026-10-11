@@ -22,7 +22,7 @@ environment:
 ports:
   8007/tcp: 8007
   5223/tcp: 5223
-  8883/tcp: 8883
+  8883/tcp: 18883
   443/tcp: null
   1883/tcp: null
   1223/tcp: null
