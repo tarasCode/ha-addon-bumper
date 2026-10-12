@@ -12,3 +12,10 @@ The add-on builds on the upstream image and applies `bumper/patch_legacy_ctl.py`
 relays commands from Home Assistant's `ecovacs` integration (sucks) without the `id` attribute the
 Ecovacs cloud adds, so the robot acks but sends no data, and relays replies without the `td` name
 sucks needs. The patch adds both. The build fails if upstream code changes under the patch.
+
+## Map of a legacy XMPP robot
+
+Set the option `map_bot` to the robot's XMPP address (`<did>@<class>.ecorobot.net/atom`) and the
+add-on redraws the map stored in the robot every 10 minutes into `/share/deebot/mappa.png`
+(`deebot_map.py`, standard library only, rewritten only when the map changes). Show it in HA
+with a Local File camera pointing at that path. Empty option = no map, nothing runs.

@@ -1,5 +1,5 @@
 name: Bumper
-version: "0.4.1-vallenza.3"
+version: "0.4.1-vallenza.4"
 slug: bumper
 description: Self-hosted Ecovacs cloud (MVladislav/bumper) for local control of Deebot robots
 url: https://github.com/MVladislav/bumper
@@ -11,6 +11,11 @@ startup: services
 boot: auto
 map:
   - addon_config:rw
+  - share:rw
+options:
+  map_bot: ""
+schema:
+  map_bot: str?
 environment:
   BUMPER_LISTEN: 0.0.0.0
   BUMPER_ANNOUNCE_IP: 192.168.0.115
