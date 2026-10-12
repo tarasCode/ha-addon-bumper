@@ -5,7 +5,8 @@ The Ecovacs cloud does two things Bumper 0.4.1 does not:
    (it acks the iq but sends no data);
 2. it puts the `td` name back on the bot's reply (`<ctl id=.. ret="ok"><battery/>` becomes
    `<ctl td="BatteryInfo" ..>`); sucks drops replies without `td`.
-Both are done here with a small id -> td map. The build fails if the anchors are not found,
+Both are done here with a small id -> td map. A halted 930 also reports clean type="auto"
+(st="h"), which HA shows as cleaning; such reports are rewritten to type="stop". The build fails if the anchors are not found,
 so a new Bumper version cannot silently ship without the fix.
 """
 
@@ -49,11 +50,17 @@ def _vallenza_tag_request(xml) -> None:
 
 def _vallenza_tag_response(xml) -> None:
     ctl = _vallenza_ctl(xml)
-    if ctl is None or ctl.get("td"):
+    if ctl is None:
         return
-    reply = _VALLENZA_PENDING.pop(ctl.get("id") or "", None)
-    if reply:
-        ctl.set("td", reply)
+    if not ctl.get("td"):
+        reply = _VALLENZA_PENDING.pop(ctl.get("id") or "", None)
+        if reply:
+            ctl.set("td", reply)
+    # A halted 930 still reports type="auto" (st="h"); sucks would read it as cleaning.
+    if ctl.get("td") == "CleanReport":
+        for clean in ctl:
+            if clean.tag.endswith("clean") and clean.get("st") == "h":
+                clean.set("type", "stop")
 # --- end vallenza patch ---
 '''
 
