@@ -5,3 +5,10 @@ Home Assistant add-on, so Ecovacs Deebot robots can be controlled locally with t
 integration in `self_hosted` mode. No secrets or house data are stored here.
 
 Data and certificates live in the add-on config folder. Port 1883 is left unpublished on purpose.
+
+## Patch for legacy XMPP robots (OZMO 930 and similar)
+
+The add-on builds on the upstream image and applies `bumper/patch_legacy_ctl.py`: Bumper 0.4.1
+relays commands from Home Assistant's `ecovacs` integration (sucks) without the `id` attribute the
+Ecovacs cloud adds, so the robot acks but sends no data, and relays replies without the `td` name
+sucks needs. The patch adds both. The build fails if upstream code changes under the patch.

@@ -1,12 +1,11 @@
 name: Bumper
-version: "0.4.1"
+version: "0.4.1-vallenza.1"
 slug: bumper
 description: Self-hosted Ecovacs cloud (MVladislav/bumper) for local control of Deebot robots
 url: https://github.com/MVladislav/bumper
 arch:
   - aarch64
   - amd64
-image: ghcr.io/mvladislav/bumper
 init: false
 startup: services
 boot: auto
