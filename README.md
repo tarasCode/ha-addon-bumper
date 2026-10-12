@@ -18,5 +18,5 @@ sucks needs. The patch adds both. The build fails if upstream code changes under
 Set the option `map_bot` to the robot's XMPP address (`<did>@<class>.ecorobot.net/atom`) and the
 add-on draws the map stored in the robot into `/share/deebot/mappa.png` (`deebot_map.py`,
 standard library only). While the robot cleans, its position and the path it covered are
-redrawn every 5 seconds; otherwise every 2 minutes. Show it in HA
+redrawn every 5 seconds; otherwise every 30 seconds. The PNG is flipped top-down and carries a tEXt chunk "vallenza" with the calibration (pixel <-> mm) and the virtual walls, read by the HA card. Show it in HA
 with a Local File camera pointing at that path. Empty option = no map, nothing runs.

@@ -145,7 +145,8 @@ def attrs(xml, tag="ctl"):
     }
 
 
-def png(width, height, pixels):
+def png(width, height, pixels, meta=None):
+    """Encode an RGB PNG; `meta` travels in a tEXt chunk keyed "vallenza" for the HA card."""
     stride = width * 3
     rows = b"".join(
         b"\x00" + bytes(pixels[y * stride : (y + 1) * stride]) for y in range(height)
@@ -162,6 +163,7 @@ def png(width, height, pixels):
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + (chunk(b"tEXt", b"vallenza\0" + json.dumps(meta).encode()) if meta else b"")
         + chunk(b"IDAT", zlib.compress(rows, 6))
         + chunk(b"IEND", b"")
     )
@@ -184,7 +186,8 @@ class MapState:
         self.trail_file = os.path.join(os.path.dirname(out), "percorso.json")
         self.layout = None
         self.grid = None
-        self.walls_xml = ""
+        self.walls = {}
+        self.msid = "1"
         self.trail = []
         self.robot_mm = None
         self.cleaning = False
@@ -195,6 +198,29 @@ class MapState:
             self.trail = [tuple(p) for p in saved.get("trail", [])]
         except (OSError, ValueError):
             pass
+        # A saved path means a run may still be going: do not wipe it on the first reading.
+        self.cleaning = bool(self.trail)
+
+    def refresh_walls(self, conn, bot):
+        """Virtual walls: GetMapSet lists their ids, PullM gives each one's points (mm)."""
+        listing = conn.ctl(bot, '<ctl td="GetMapSet" tp="vw" />')
+        msid = attrs(listing).get("msid", "1")
+        mids = re.findall(r"mid=['\"](\d+)['\"]", listing)
+        walls = {}
+        for mid in mids:
+            if mid in self.walls:
+                walls[mid] = self.walls[mid]
+                continue
+            raw = attrs(
+                conn.ctl(bot, f'<ctl td="PullM" tp="vw" msid="{msid}" mid="{mid}" />')
+            ).get("m", "")
+            nums = [float(v) for v in raw.strip("[]").split(",") if v.strip()]
+            # The robot pads the point list with 0,0 pairs.
+            while len(nums) >= 4 and nums[-2:] == [0.0, 0.0]:
+                nums = nums[:-2]
+            walls[mid] = nums
+        self.walls = walls
+        self.msid = msid
 
     def refresh_map(self, conn, bot):
         info = attrs(conn.ctl(bot, '<ctl td="GetMapM" />'))
@@ -202,7 +228,6 @@ class MapState:
             return
         key = (info["i"], info["m"])
         if self.layout and self.layout["key"] == key:
-            self.walls_xml = conn.ctl(bot, '<ctl td="GetMapSet" tp="vw" />')
             return
         w, h, rows, cols = (
             int(info["w"]),
@@ -236,7 +261,6 @@ class MapState:
             "res": int(info.get("p", "50")),
         }
         self.grid = grid
-        self.walls_xml = conn.ctl(bot, '<ctl td="GetMapSet" tp="vw" />')
 
     def refresh_robot(self, conn, bot):
         clean = attrs(conn.ctl(bot, '<ctl td="GetCleanState" />'), "clean")
@@ -274,8 +298,7 @@ class MapState:
             return int(width / 2 + xmm / res), int(height / 2 + ymm / res)
 
         walls = set()
-        for item in re.findall(r"<m [^>]*p=['\"]([^'\"]+)", self.walls_xml):
-            nums = [float(v) for v in item.split(",")]
+        for nums in self.walls.values():
             pts = [cell(nums[i], nums[i + 1]) for i in range(0, len(nums) - 1, 2)]
             for a, b in zip(pts, pts[1:]):
                 segment(walls, a, b)
@@ -315,9 +338,24 @@ class MapState:
                     color = ROBOT
                 row = bytes(color) * SCALE
                 for dy in range(SCALE):
-                    base = (((y - y0) * SCALE + dy) * ow + (x - x0) * SCALE) * 3
+                    # Rows are flipped: seen from above, the robot's y grows upwards (Fabio, 12/10).
+                    base = (((y1 - y) * SCALE + dy) * ow + (x - x0) * SCALE) * 3
                     pixels[base : base + 3 * SCALE] = row
-        image = png(ow, oh, pixels)
+        # The HA card maps a pixel (px, py) back to robot mm with these numbers:
+        # x_mm = (px / scale + x0 - half_w) * res,  y_mm = (y1 - py / scale - half_h) * res.
+        meta = {
+            "scale": SCALE,
+            "res": res,
+            "x0": x0,
+            "y1": y1,
+            "half_w": width / 2,
+            "half_h": height / 2,
+            "walls": dict(self.walls),
+            "msid": self.msid,
+            "robot": list(self.robot_mm) if self.robot_mm else None,
+            "cleaning": self.cleaning,
+        }
+        image = png(ow, oh, pixels, meta)
         if image == self.last_image and os.path.exists(self.out):
             return False
         with open(self.out + ".tmp", "wb") as f:
@@ -337,7 +375,7 @@ def main():
         "--live", type=int, default=5, help="seconds between updates while cleaning"
     )
     ap.add_argument(
-        "--idle", type=int, default=120, help="seconds between updates otherwise"
+        "--idle", type=int, default=30, help="seconds between updates otherwise"
     )
     ap.add_argument(
         "--map-every",
@@ -355,6 +393,7 @@ def main():
             if conn is None:
                 conn = Xmpp(args.host, args.port, "deebotmap", "ecouser.net", "map")
             state.refresh_robot(conn, args.bot)
+            state.refresh_walls(conn, args.bot)
             # While cleaning the robot extends its map: check pieces every minute, otherwise rarely.
             if time.time() >= next_map:
                 state.refresh_map(conn, args.bot)
