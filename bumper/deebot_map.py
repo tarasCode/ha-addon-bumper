@@ -1,15 +1,20 @@
-"""Draw the map stored in an XMPP Deebot (OZMO 930 family) to a PNG, through the local Bumper.
+"""Draw the map of an XMPP Deebot (OZMO 930 family) to a PNG, live, through the local Bumper.
 
-Stdlib only, so it runs inside the add-on without new packages. It logs into Bumper's
-XMPP server as a client, asks the bot for the map layout (GetMapM), downloads the pieces
-that are not empty (PullMP, base64 LZMA), adds the virtual walls (GetMapSet tp=vw) and
-the robot_at position, and writes the image only when the map changed.
+Stdlib only, so it runs inside the add-on without new packages. It logs into Bumper's XMPP
+server as a client and keeps one connection open:
+- the map layout (GetMapM) and its non-empty pieces (PullMP, base64 LZMA) are downloaded
+  again only when a piece's CRC changes;
+- virtual walls come from GetMapSet tp=vw;
+- while the robot cleans, its position (GetPos) is read every few seconds and the path it
+  covered is painted on the map; a new cleaning run starts a new path.
+The image is rewritten atomically only when something visible changed.
 
-Usage: deebot_map.py --bot <did>@<class>.ecorobot.net/atom --out /path/map.png [--every 600]
+Usage: deebot_map.py --bot <did>@<class>.ecorobot.net/atom --out /path/map.png
 """
 
 import argparse
 import base64
+import json
 import lzma
 import os
 import re
@@ -21,9 +26,15 @@ import time
 import uuid
 import zlib
 
-COLORS = {0: (255, 255, 255), 1: (186, 218, 255), 2: (40, 40, 60), 3: (186, 218, 255)}
-WALL = (230, 60, 60)
-ROBOT = (40, 170, 70)
+FLOOR = (186, 218, 255)
+WALL_CELL = (40, 40, 60)
+BACKGROUND = (255, 255, 255)
+CLEANED = (110, 200, 140)
+VIRTUAL_WALL = (230, 60, 60)
+ROBOT = (20, 90, 200)
+CELL_COLORS = {1: FLOOR, 2: WALL_CELL, 3: FLOOR}
+SCALE = 4
+ROBOT_RADIUS_MM = 170
 
 
 class Xmpp:
@@ -37,6 +48,7 @@ class Xmpp:
         self._read_until("</stream:features>")
         self._send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")
         self._read_until("<proceed")
+        # Bumper only has a self-signed certificate and this connection never leaves the add-on.
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -72,20 +84,24 @@ class Xmpp:
     def _send(self, text):
         self.sock.sendall(text.encode())
 
+    def _recv(self, timeout):
+        self.sock.settimeout(max(0.1, timeout))
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("server closed the stream")
+        self.buf += chunk.decode(errors="replace")
+
     def _read_until(self, marker, timeout=20.0):
         end = time.time() + timeout
         while marker not in self.buf:
             if time.time() > end:
                 raise TimeoutError(f"no {marker!r} from server")
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("server closed the stream")
-            self.buf += chunk.decode(errors="replace")
+            self._recv(end - time.time())
         head, _, self.buf = self.buf.partition(marker)
         return head + marker
 
     def ctl(self, bot, body, timeout=15.0):
-        """Send one ctl to the bot and return the attributes of its reply ctl."""
+        """Send one ctl to the bot and return its reply, up to the closing iq."""
         cid = uuid.uuid4().hex[:8]
         me = f"{self.user}@{self.domain}/{self.resource}"
         body = body.replace("<ctl ", f'<ctl id="{cid}" ', 1)
@@ -93,23 +109,22 @@ class Xmpp:
             f'<iq type="set" id="m{cid}" from="{me}" to="{bot}"><query xmlns="com:ctl">{body}</query></iq>'
         )
         end = time.time() + timeout
-        while time.time() < end:
+        while True:
             m = re.search(r"<ctl[^>]*id=['\"]" + cid + r"['\"]", self.buf)
             if m:
                 tail = self.buf[m.start() :]
                 close = tail.find("</iq>")
                 if close >= 0:
-                    reply = tail[:close]
                     self.buf = tail[close + 5 :]
-                    return reply
-            self.sock.settimeout(max(0.1, end - time.time()))
+                    return tail[:close]
+            if time.time() > end:
+                break
             try:
-                chunk = self.sock.recv(65536)
+                self._recv(end - time.time())
             except socket.timeout:
                 break
-            if not chunk:
-                raise ConnectionError("server closed the stream")
-            self.buf += chunk.decode(errors="replace")
+        # Drop what piled up (pushes from the bot) so the buffer does not grow forever.
+        self.buf = self.buf[-4096:]
         raise TimeoutError(f"no reply to {body[:40]}")
 
     def close(self):
@@ -120,17 +135,20 @@ class Xmpp:
             pass
 
 
-def attrs(xml):
-    head = xml.split("<ctl", 1)[1].split(">", 1)[0]
+def attrs(xml, tag="ctl"):
+    part = xml.split("<" + tag, 1)
+    if len(part) < 2:
+        return {}
+    head = part[1].split(">", 1)[0]
     return {
         k: a or b for k, a, b in re.findall(r"(\w+)=(?:\"([^\"]*)\"|'([^']*)')", head)
     }
 
 
 def png(width, height, pixels):
+    stride = width * 3
     rows = b"".join(
-        b"\x00" + bytes(pixels[y * width * 3 : (y + 1) * width * 3])
-        for y in range(height)
+        b"\x00" + bytes(pixels[y * stride : (y + 1) * stride]) for y in range(height)
     )
 
     def chunk(kind, data):
@@ -144,95 +162,169 @@ def png(width, height, pixels):
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(rows, 9))
+        + chunk(b"IDAT", zlib.compress(rows, 6))
         + chunk(b"IEND", b"")
     )
 
 
-def line(points_set, x0, y0, x1, y1):
+def segment(cells, a, b, radius=0):
+    (x0, y0), (x1, y1) = a, b
     steps = max(abs(x1 - x0), abs(y1 - y0), 1)
     for i in range(steps + 1):
-        points_set.add(
-            (round(x0 + (x1 - x0) * i / steps), round(y0 + (y1 - y0) * i / steps))
+        cx, cy = round(x0 + (x1 - x0) * i / steps), round(y0 + (y1 - y0) * i / steps)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx * dx + dy * dy <= radius * radius:
+                    cells.add((cx + dx, cy + dy))
+
+
+class MapState:
+    def __init__(self, out):
+        self.out = out
+        self.trail_file = os.path.join(os.path.dirname(out), "percorso.json")
+        self.layout = None
+        self.grid = None
+        self.walls_xml = ""
+        self.trail = []
+        self.robot_mm = None
+        self.cleaning = False
+        self.last_image = None
+        try:
+            with open(self.trail_file) as f:
+                saved = json.load(f)
+            self.trail = [tuple(p) for p in saved.get("trail", [])]
+        except (OSError, ValueError):
+            pass
+
+    def refresh_map(self, conn, bot):
+        info = attrs(conn.ctl(bot, '<ctl td="GetMapM" />'))
+        if not info.get("m"):
+            return
+        key = (info["i"], info["m"])
+        if self.layout and self.layout["key"] == key:
+            self.walls_xml = conn.ctl(bot, '<ctl td="GetMapSet" tp="vw" />')
+            return
+        w, h, rows, cols = (
+            int(info["w"]),
+            int(info["h"]),
+            int(info["r"]),
+            int(info["c"]),
+        )
+        crcs = info["m"].split(",")
+        empty = max(set(crcs), key=crcs.count)
+        width, height = cols * w, rows * h
+        grid = bytearray(width * height)
+        for pid, crc in enumerate(crcs):
+            if crc == empty:
+                continue
+            raw = base64.b64decode(
+                attrs(conn.ctl(bot, f'<ctl td="PullMP" pid="{pid}" />'))["p"]
+            )
+            data = lzma.decompress(
+                raw[:9] + b"\x00\x00\x00\x00" + raw[9:], format=lzma.FORMAT_ALONE
+            )
+            # Piece data is column-major against the robot's axes: transpose it, so that a
+            # position (x, y) in mm lands on column x and row y (checked against GetPos while cleaning).
+            pr, pc = divmod(pid, cols)
+            for y in range(h):
+                for x in range(w):
+                    grid[(pc * w + x) * width + pr * h + y] = data[y * w + x]
+        self.layout = {
+            "key": key,
+            "width": width,
+            "height": height,
+            "res": int(info.get("p", "50")),
+        }
+        self.grid = grid
+        self.walls_xml = conn.ctl(bot, '<ctl td="GetMapSet" tp="vw" />')
+
+    def refresh_robot(self, conn, bot):
+        clean = attrs(conn.ctl(bot, '<ctl td="GetCleanState" />'), "clean")
+        cleaning = clean.get("st") == "s" and clean.get("type") not in ("stop", None)
+        if cleaning and not self.cleaning:
+            self.trail = []
+        self.cleaning = cleaning
+        pos = attrs(conn.ctl(bot, '<ctl td="GetPos" />'))
+        if pos.get("p"):
+            x, y = (float(v) for v in pos["p"].split(","))
+            self.robot_mm = (x, y)
+            if cleaning and (
+                not self.trail
+                or abs(self.trail[-1][0] - x) + abs(self.trail[-1][1] - y) > 40
+            ):
+                self.trail.append((x, y))
+                try:
+                    with open(self.trail_file + ".tmp", "w") as f:
+                        json.dump({"trail": self.trail}, f)
+                    os.replace(self.trail_file + ".tmp", self.trail_file)
+                except OSError:
+                    pass
+
+    def render(self):
+        if not self.layout:
+            return False
+        width, height, res = (
+            self.layout["width"],
+            self.layout["height"],
+            self.layout["res"],
         )
 
+        # Coordinates in walls and positions are mm from the map centre; a cell is `res` mm.
+        def cell(xmm, ymm):
+            return int(width / 2 + xmm / res), int(height / 2 + ymm / res)
 
-def draw(conn, bot, out, last_sig):
-    info = attrs(conn.ctl(bot, '<ctl td="GetMapM" />'))
-    w, h, rows, cols = int(info["w"]), int(info["h"]), int(info["r"]), int(info["c"])
-    resolution = int(info.get("p", "50"))
-    crcs = info["m"].split(",")
-    walls_xml = conn.ctl(bot, '<ctl td="GetMapSet" tp="vw" />')
-    # The 930 answers GetChargerPos with ret="fail"; GetPos gives the robot itself (mm, "x,y").
-    try:
-        pos_xml = conn.ctl(bot, '<ctl td="GetPos" />')
-    except TimeoutError:
-        pos_xml = ""
-    sig = (
-        info["i"] + info["m"] + walls_xml.split(">", 1)[-1] + pos_xml.split(">", 1)[-1]
-    )
-    if sig == last_sig and os.path.exists(out):
-        return sig, False
+        walls = set()
+        for item in re.findall(r"<m [^>]*p=['\"]([^'\"]+)", self.walls_xml):
+            nums = [float(v) for v in item.split(",")]
+            pts = [cell(nums[i], nums[i + 1]) for i in range(0, len(nums) - 1, 2)]
+            for a, b in zip(pts, pts[1:]):
+                segment(walls, a, b)
+        cleaned = set()
+        radius = max(1, ROBOT_RADIUS_MM // res)
+        pts = [cell(*p) for p in self.trail]
+        for a, b in zip(pts, pts[1:] or pts):
+            segment(cleaned, a, b, radius)
+        robot = cell(*self.robot_mm) if self.robot_mm else None
 
-    empty = max(set(crcs), key=crcs.count)
-    width, height = cols * w, rows * h
-    grid = bytearray(width * height)
-    for pid, crc in enumerate(crcs):
-        if crc == empty:
-            continue
-        reply = conn.ctl(bot, f'<ctl td="PullMP" pid="{pid}" />')
-        raw = base64.b64decode(attrs(reply)["p"])
-        data = lzma.decompress(
-            raw[:9] + b"\x00\x00\x00\x00" + raw[9:], format=lzma.FORMAT_ALONE
-        )
-        pr, pc = divmod(pid, cols)
-        for y in range(h):
-            start = (pr * h + y) * width + pc * w
-            grid[start : start + w] = data[y * w : (y + 1) * w]
-
-    # Map cells are `resolution` mm wide; coordinates in walls and robot position are mm from the map centre.
-    def cell(xmm, ymm):
-        return int(width / 2 + float(xmm) / resolution), int(
-            height / 2 + float(ymm) / resolution
-        )
-
-    walls = set()
-    for item in re.findall(r"<m [^>]*p=['\"]([^'\"]+)", walls_xml):
-        nums = [float(v) for v in item.split(",")]
-        pts = [cell(nums[i], nums[i + 1]) for i in range(0, len(nums) - 1, 2)]
-        for a, b in zip(pts, pts[1:]):
-            line(walls, *a, *b)
-    robot_at = None
-    m = re.search(r"p=['\"](-?[\d.]+),(-?[\d.]+)", pos_xml)
-    if m:
-        robot_at = cell(m.group(1), m.group(2))
-
-    used = [i for i, v in enumerate(grid) if v]
-    if not used:
-        return sig, False
-    xs, ys = [i % width for i in used], [i // width for i in used]
-    x0, x1, y0, y1 = min(xs) - 3, max(xs) + 3, min(ys) - 3, max(ys) + 3
-    scale = 4
-    ow, oh = (x1 - x0 + 1) * scale, (y1 - y0 + 1) * scale
-    pixels = bytearray(ow * oh * 3)
-    for y in range(y0, y1 + 1):
-        for x in range(x0, x1 + 1):
-            if (x, y) in walls:
-                color = WALL
-            elif robot_at and abs(x - robot_at[0]) <= 2 and abs(y - robot_at[1]) <= 2:
-                color = ROBOT
-            elif 0 <= x < width and 0 <= y < height:
-                color = COLORS.get(grid[y * width + x], COLORS[0])
-            else:
-                color = COLORS[0]
-            for dy in range(scale):
-                base = (((y - y0) * scale + dy) * ow + (x - x0) * scale) * 3
-                pixels[base : base + 3 * scale] = bytes(color) * scale
-    tmp = out + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(png(ow, oh, pixels))
-    os.replace(tmp, out)
-    return sig, True
+        used = [i for i, v in enumerate(self.grid) if v]
+        if not used:
+            return False
+        xs, ys = [i % width for i in used], [i // width for i in used]
+        x0, x1, y0, y1 = min(xs) - 3, max(xs) + 3, min(ys) - 3, max(ys) + 3
+        ow, oh = (x1 - x0 + 1) * SCALE, (y1 - y0 + 1) * SCALE
+        pixels = bytearray(ow * oh * 3)
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                value = (
+                    self.grid[y * width + x]
+                    if 0 <= x < width and 0 <= y < height
+                    else 0
+                )
+                if (x, y) in walls:
+                    color = VIRTUAL_WALL
+                elif value == 2:
+                    color = WALL_CELL
+                elif (x, y) in cleaned and value:
+                    color = CLEANED
+                else:
+                    color = CELL_COLORS.get(value, BACKGROUND)
+                if (
+                    robot
+                    and (x - robot[0]) ** 2 + (y - robot[1]) ** 2 <= (radius + 1) ** 2
+                ):
+                    color = ROBOT
+                row = bytes(color) * SCALE
+                for dy in range(SCALE):
+                    base = (((y - y0) * SCALE + dy) * ow + (x - x0) * SCALE) * 3
+                    pixels[base : base + 3 * SCALE] = row
+        image = png(ow, oh, pixels)
+        if image == self.last_image and os.path.exists(self.out):
+            return False
+        with open(self.out + ".tmp", "wb") as f:
+            f.write(image)
+        os.replace(self.out + ".tmp", self.out)
+        self.last_image = image
+        return True
 
 
 def main():
@@ -242,32 +334,48 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5223)
     ap.add_argument(
-        "--every", type=int, default=0, help="seconds between refreshes; 0 = once"
+        "--live", type=int, default=5, help="seconds between updates while cleaning"
     )
+    ap.add_argument(
+        "--idle", type=int, default=120, help="seconds between updates otherwise"
+    )
+    ap.add_argument(
+        "--map-every",
+        type=int,
+        default=600,
+        help="seconds between map checks when idle",
+    )
+    ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    sig = None
+    state = MapState(args.out)
+    conn, next_map = None, 0.0
     while True:
-        conn = None
         try:
-            conn = Xmpp(args.host, args.port, "deebotmap", "ecouser.net", "map")
-            sig, changed = draw(conn, args.bot, args.out, sig)
-            print(
-                time.strftime("%H:%M:%S"),
-                "map",
-                "updated" if changed else "unchanged",
-                flush=True,
-            )
+            if conn is None:
+                conn = Xmpp(args.host, args.port, "deebotmap", "ecouser.net", "map")
+            state.refresh_robot(conn, args.bot)
+            # While cleaning the robot extends its map: check pieces every minute, otherwise rarely.
+            if time.time() >= next_map:
+                state.refresh_map(conn, args.bot)
+                next_map = time.time() + (60 if state.cleaning else args.map_every)
+            if state.render():
+                print(
+                    time.strftime("%H:%M:%S"),
+                    "map updated",
+                    "(cleaning)" if state.cleaning else "",
+                    flush=True,
+                )
         except (
             Exception
-        ) as exc:  # the robot can be asleep or away from the network: retry next round
+        ) as exc:  # robot asleep or Bumper restarting: reconnect next round
             print(time.strftime("%H:%M:%S"), "map not read:", exc, flush=True)
-        finally:
             if conn:
                 conn.close()
-        if not args.every:
+            conn = None
+        if args.once:
             return
-        time.sleep(args.every)
+        time.sleep(args.live if state.cleaning else args.idle)
 
 
 if __name__ == "__main__":
