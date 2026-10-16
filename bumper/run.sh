@@ -4,4 +4,5 @@ BOT=$(/bumper/.venv/bin/python -c 'import json;print(json.load(open("/data/optio
 if [ -n "$BOT" ]; then
   (sleep 60; exec /bumper/.venv/bin/python /deebot_map.py --bot "$BOT" --out /share/deebot/mappa.png) &
 fi
+/bumper/.venv/bin/python /repair_db.py "$DB_FILE"
 exec /bumper/.venv/bin/bumper
